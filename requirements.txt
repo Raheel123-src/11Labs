@@ -1,0 +1,6 @@
+fastapi
+requests
+uvicorn
+browser-use
+python-dotenv
+boto3 
