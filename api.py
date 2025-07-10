@@ -12,6 +12,7 @@ from browser_use_agent_download_url import extract_download_url_from_agent, extr
 from elevenlabs_download import download_elevenlabs_history_audio
 import boto3
 from botocore.exceptions import ClientError
+import datetime
 
 # Load environment variables
 load_dotenv()
@@ -124,6 +125,25 @@ def upload_file_to_s3(file_path, bucket, object_name, expiration=3600):
         print(f"S3 upload error: {e}")
         return None
 
+def get_elevenlabs_history_ids() -> list:
+    api_key = os.getenv('ELEVENLABS_API_KEY')
+    if not api_key:
+        print('ELEVENLABS_API_KEY is not set in the environment.')
+        return []
+    url = 'https://api.elevenlabs.io/v1/history'
+    headers = {
+        'xi-api-key': api_key,
+        'Accept': 'application/json'
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return [item.get('history_item_id') for item in data.get('history', []) if 'history_item_id' in item]
+    except Exception as e:
+        print(f'Error fetching ElevenLabs history: {e}')
+        return []
+
 @app.post("/enhance-script/", response_model=ScriptResponse)
 async def enhance_script(request: ScriptRequest):
     try:
@@ -165,6 +185,10 @@ async def enhance_script(request: ScriptRequest):
             "do not download or fetch the audio file yet."
         )
 
+        # Fetch history before task 1
+        history_before = get_elevenlabs_history_ids()
+
+        # Task 1 logic remains unchanged
         print("Creating task 1 (audio generation)...")
         task1_id = create_task(instructions_task1, api_key)
         print(f"Task 1 created with ID: {task1_id}")
@@ -175,7 +199,7 @@ async def enhance_script(request: ScriptRequest):
         # Process the results from task 1
         enhanced_script = None
         audio_id = None
-        message = "Audio generated and download link fetched via two-step process."
+        message = "Audio generated and uploaded to S3."
 
         # Try to extract enhanced script from output
         steps = details.get('steps', [])
@@ -215,12 +239,26 @@ async def enhance_script(request: ScriptRequest):
                 print(f"Found audio_id: {audio_id}")
                 break
 
-        # After audio generation, fetch the latest history item id
+        # Fetch history before task 1
+        history_before = get_elevenlabs_history_ids()
+
+        # Poll for new history item
         latest_history_item_id = None
-        try:
-            latest_history_item_id = get_latest_history_item_id()
-        except Exception as e:
-            print(f"Failed to fetch latest history item id: {e}")
+        poll_start = datetime.datetime.now()
+        max_wait = 30  # seconds
+        while (datetime.datetime.now() - poll_start).total_seconds() < max_wait:
+            history_after = get_elevenlabs_history_ids()
+            new_ids = [hid for hid in history_after if hid not in history_before]
+            if new_ids:
+                latest_history_item_id = new_ids[0]
+                print(f"New history item found: {latest_history_item_id}")
+                break
+            time.sleep(2)
+        if not latest_history_item_id:
+            print("No new history item found after polling, falling back to most recent.")
+            history_after = get_elevenlabs_history_ids()
+            if history_after:
+                latest_history_item_id = history_after[0]
 
         # Download the audio file to /uploads
         elevenlabs_downloaded_audio_path = None
@@ -244,6 +282,8 @@ async def enhance_script(request: ScriptRequest):
             file_name = pathlib.Path(elevenlabs_downloaded_audio_path).name
             s3_key = f"{s3_folder}{file_name}" if s3_folder else file_name
             s3_audio_url = upload_file_to_s3(elevenlabs_downloaded_audio_path, s3_bucket, s3_key)
+            if s3_audio_url:
+                print(f"S3 download link: {s3_audio_url}")
 
         return ScriptResponse(
             enhanced_script=enhanced_script,
